@@ -184,7 +184,7 @@ def create_guarded_http_operation(
         except (InvalidJson, UnsupportedJsonShape) as error:
             raise UnsupportedGuardedPayload(str(error)) from error
 
-    operation = BufferedGuardedOperation[GuardableProviderRequest, BufferedHttpResponse](
+    operation: BufferedGuardedOperation[GuardableProviderRequest, BufferedHttpResponse] = BufferedGuardedOperation(
         name=endpoint.operation_name,
         input_projection=project_request,
         output_projection=project_response,
