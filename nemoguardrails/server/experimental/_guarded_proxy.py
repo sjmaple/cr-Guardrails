@@ -184,12 +184,6 @@ def create_guarded_http_operation(
         except (InvalidJson, UnsupportedJsonShape) as error:
             raise UnsupportedGuardedPayload(str(error)) from error
 
-    operation: BufferedGuardedOperation[GuardableProviderRequest, BufferedHttpResponse] = BufferedGuardedOperation(
-        name=endpoint.operation_name,
-        input_projection=project_request,
-        output_projection=project_response,
-    )
-
     async def handle_prepared_request(
         prepared_input: PreparedOperationInput[GuardableProviderRequest],
     ):
@@ -227,7 +221,7 @@ def create_guarded_http_operation(
         )
 
     success_content = {"application/json": {"schema": {}}}
-    if endpoint.stream_adapter_factory is not None:
+    if endpoint.stream_adapter_factory is not None and stream_dispatch is not None:
         success_content["text/event-stream"] = {"schema": {"type": "string"}}
     documented_responses = errors.documented_responses
     documented_responses[200] = {
