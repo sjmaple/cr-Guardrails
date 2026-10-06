@@ -55,11 +55,12 @@ class ChatCompletionsStreamErrorProjection(GuardedProjectionModel):
 
 
 class ChatCompletionsStreamChoiceProjection(GuardedContentModel):
-    model_config = ConfigDict(extra="allow")
-
+    model_config = ConfigDict(
+        extra="forbid",
+    )
     delta: ChatCompletionsStreamDeltaProjection
     finish_reason: Any | None = None
-    index: Annotated[int, Field(strict=True, ge=0, le=0)]
+    index: Annotated[int, Field(ge=0, le=0, strict=True)]
     logprobs: Any | None = None
 
 

@@ -22,8 +22,16 @@ from pathlib import Path
 import pytest
 import yaml
 
+from nemoguardrails.server.experimental._content_checker import ContentAllowed, StreamBufferingPolicy
+from nemoguardrails.server.experimental._guarded_stream import guard_provider_stream
 from nemoguardrails.server.experimental.provider.sse import ServerSentEvent
-from nemoguardrails.server.experimental.provider.stream import StreamEventRole, UnsupportedProviderStream
+from nemoguardrails.server.experimental.provider.stream import (
+    ClassifiedStreamAdapter,
+    StreamEventRole,
+    UnsupportedProviderStream,
+    create_classified_stream_adapter_factory,
+)
+from nemoguardrails.server.experimental.provider.types import GuardedMessage
 from nemoguardrails.server.experimental.providers.openai.chat_completions.request_binding import (
     PAYLOAD_CONTRACT,
     REQUEST_CONSTRAINED_FIELDS,
@@ -47,6 +55,7 @@ from nemoguardrails.server.experimental.providers.openai.chat_completions.stream
 from nemoguardrails.server.experimental.providers.openai.chat_completions.stream_hooks import (
     ChatCompletionsStreamHooks,
 )
+from nemoguardrails.server.experimental.providers.openai.errors import render_openai_error
 
 
 def event(payload):
@@ -214,6 +223,15 @@ def test_stream_modules_match_the_public_guard_contract():
                 declared_opaque.add(event_policy["missing_text_shape"])
                 choices = schema["properties"]["choices"]["items"]
                 delta = choices["properties"]["delta"]
+                projection_choices = rule.model.model_json_schema()["$defs"]["ChatCompletionsStreamChoiceProjection"]
+                projection_delta = rule.model.model_json_schema()["$defs"]["ChatCompletionsStreamDeltaProjection"]
+                assert choices["additionalProperties"] is projection_choices["additionalProperties"] is False
+                assert delta["additionalProperties"] is projection_delta["additionalProperties"] is False
+                assert "unknown_fields" not in choices[extension]
+                assert "unknown_fields" not in delta[extension]
+                assert set(projection_choices["properties"]) == set(choices["properties"]) | set(
+                    choices[extension]["opaque_fields"]
+                )
                 assert delta["properties"]["content"][extension]["subject"]["role"] == "assistant"
                 assert set(rule.model.model_fields) == set(schema["properties"])
                 assert STREAM_FIELDS[0] == frozenset(
@@ -248,3 +266,195 @@ def test_stream_choice_index_requires_the_declared_integer_zero(index):
 
     with pytest.raises(UnsupportedProviderStream):
         STREAM_CLASSIFIER.classify_event(event(native))
+
+
+@pytest.mark.parametrize("delta", [{"content": "safe"}, {"role": "assistant"}, {}])
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"message": {"role": "assistant", "content": "unchecked"}},
+        {"text": "unchecked"},
+        {"future_content": "unchecked"},
+    ],
+)
+def test_stream_classifier_rejects_unreviewed_choice_fields(delta, fields):
+    with pytest.raises(UnsupportedProviderStream):
+        STREAM_CLASSIFIER.classify_event(event(chunk(delta, **fields)))
+
+
+def test_stream_classifier_preserves_reviewed_choice_metadata():
+    native = chunk({"content": "safe"}, finish_reason="stop", logprobs={"content": [{"token": "safe"}]})
+
+    classified = STREAM_CLASSIFIER.classify_event(event(native))
+
+    assert classified.text == "safe"
+
+
+def observe(hooks, value):
+    parsed = value if isinstance(value, ServerSentEvent) else event(value)
+    hooks.observe_event(parsed, STREAM_CLASSIFIER.classify_event(parsed))
+
+
+@pytest.mark.parametrize("keepalive", [b": keepalive\n\n", b"\n", b"id: keepalive\n\n"])
+def test_stream_hooks_require_actual_done_after_keepalives(keepalive):
+    hooks = ChatCompletionsStreamHooks()
+    observe(hooks, ServerSentEvent.from_bytes(keepalive))
+
+    with pytest.raises(UnsupportedProviderStream, match="before.*DONE"):
+        hooks.validate_end_of_stream()
+
+    observe(hooks, chunk({"content": "safe"}))
+    observe(hooks, b"[DONE]")
+    observe(hooks, ServerSentEvent.from_bytes(keepalive))
+    hooks.validate_end_of_stream()
+
+
+@pytest.mark.parametrize("tail", [b"[DONE]", chunk({"content": "later"}), chunk({}), {"error": {"message": "late"}}])
+def test_stream_hooks_reject_data_after_done(tail):
+    hooks = ChatCompletionsStreamHooks()
+    observe(hooks, b"[DONE]")
+
+    with pytest.raises(UnsupportedProviderStream, match="after.*DONE"):
+        observe(hooks, tail)
+
+
+@pytest.mark.parametrize("done", [False, True])
+def test_stream_hooks_preserve_provider_error_endings(done):
+    hooks = ChatCompletionsStreamHooks()
+    observe(hooks, {"error": {"message": "upstream failed"}})
+    observe(hooks, ServerSentEvent.from_bytes(b": keepalive\n\n"))
+    if done:
+        observe(hooks, b"[DONE]")
+
+    hooks.validate_end_of_stream()
+
+
+@pytest.mark.parametrize("tail", [chunk({"content": "later"}), chunk({}), {"error": {"message": "again"}}])
+def test_stream_hooks_reject_payloads_after_provider_error(tail):
+    hooks = ChatCompletionsStreamHooks()
+    observe(hooks, {"error": {"message": "upstream failed"}})
+
+    with pytest.raises(UnsupportedProviderStream, match="after.*error"):
+        observe(hooks, tail)
+
+
+def test_stream_adapter_factory_creates_independent_completion_state():
+    factory = create_classified_stream_adapter_factory(STREAM_CLASSIFIER, ChatCompletionsStreamHooks)
+    first, second = factory(), factory()
+    first.classify_event(event(b"[DONE]"))
+    second.classify_event(event(chunk({"content": "safe"})))
+
+    first.validate_end_of_stream()
+    with pytest.raises(UnsupportedProviderStream):
+        second.validate_end_of_stream()
+    second.classify_event(event(b"[DONE]"))
+    second.validate_end_of_stream()
+
+
+class StreamChecker:
+    def __init__(self):
+        self.checked = []
+
+    async def check_output(self, check):
+        self.checked.append(check.output_content)
+        return ContentAllowed()
+
+
+async def guarded_events(events, chunk_size=1):
+    closed = []
+
+    async def source():
+        try:
+            for item in events:
+                yield item.raw
+        finally:
+            closed.append(True)
+
+    checker = StreamChecker()
+    result = b"".join(
+        [
+            raw
+            async for raw in guard_provider_stream(
+                source(),
+                checker=checker,
+                streaming_policy=StreamBufferingPolicy(chunk_size, 0),
+                input_message=GuardedMessage("user", "question"),
+                adapter=ClassifiedStreamAdapter(STREAM_CLASSIFIER, ChatCompletionsStreamHooks()),
+                render_outcome=render_openai_error,
+            )
+        ]
+    )
+    assert closed == [True]
+    return result, checker.checked
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("delta", [{"content": "safe"}, {"role": "assistant"}])
+async def test_guarded_stream_hides_unreviewed_choice_content(delta):
+    invalid = event(chunk(delta, message={"content": "unchecked"}))
+
+    result, checked = await guarded_events([invalid, event(b"[DONE]")])
+
+    assert invalid.raw not in result
+    assert b"unchecked" not in result
+    assert checked == []
+    assert b"unsupported_chat_completions_response_shape" in result
+    assert result.endswith(event(b"[DONE]").raw)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("chunk_size", [1, 2])
+async def test_guarded_stream_reports_missing_done_without_releasing_pending_text(chunk_size):
+    text = event(chunk({"content": "safe"}))
+
+    result, checked = await guarded_events([text], chunk_size)
+
+    assert (text.raw in result) is (chunk_size == 1)
+    assert checked == (["safe"] if chunk_size == 1 else [])
+    assert b"unsupported_chat_completions_response_shape" in result
+    assert result.endswith(event(b"[DONE]").raw)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tail", [event(b"[DONE]"), event(chunk({"content": "later"}))])
+async def test_guarded_stream_hides_invalid_events_after_done(tail):
+    text = event(chunk({"content": "safe"}))
+
+    result, checked = await guarded_events([text, event(b"[DONE]"), tail])
+
+    assert result.startswith(text.raw)
+    assert checked == ["safe"]
+    assert b"later" not in result
+    assert b"unsupported_chat_completions_response_shape" in result
+    assert result.count(event(b"[DONE]").raw) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("done", [False, True])
+async def test_guarded_stream_preserves_provider_errors_without_synthesizing_another(done):
+    events = [event({"error": {"message": "upstream failed"}})]
+    if done:
+        events.append(event(b"[DONE]"))
+
+    result, checked = await guarded_events(events)
+
+    assert result == b"".join(item.raw for item in events)
+    assert checked == []
+
+
+@pytest.mark.asyncio
+async def test_guarded_stream_preserves_valid_sequence_and_reviewed_metadata():
+    events = [
+        ServerSentEvent.from_bytes(b": keepalive\r\n\r\n"),
+        event(chunk({"role": "assistant"})),
+        event(chunk({"content": "safe"}, finish_reason=None, logprobs={"content": []})),
+        event(chunk({}, finish_reason="stop")),
+        event({"object": "chat.completion.chunk", "choices": [], "usage": {"total_tokens": 1}}),
+        event(b"[DONE]"),
+        ServerSentEvent.from_bytes(b": trailing keepalive\n\n"),
+    ]
+
+    result, checked = await guarded_events(events)
+
+    assert result == b"".join(item.raw for item in events)
+    assert checked == ["safe"]

@@ -270,10 +270,10 @@ stream:
     properties:
       choices:
         items:
-          additionalProperties: true
+          additionalProperties: false
           properties:
             delta:
-              additionalProperties: true
+              additionalProperties: false
               properties:
                 audio:
                   default: null
@@ -326,7 +326,6 @@ stream:
               title: ChatCompletionsStreamDeltaProjection
               type: object
               x-nemo-guardrails:
-                unknown_fields: configurable
                 source: '#/components/schemas/ChatCompletionStreamResponseDelta'
                 classification: guarded
             finish_reason:
@@ -342,7 +341,6 @@ stream:
           title: ChatCompletionsStreamChoiceProjection
           type: object
           x-nemo-guardrails:
-            unknown_fields: configurable
             opaque_fields:
             - logprobs
         maxItems: 1
