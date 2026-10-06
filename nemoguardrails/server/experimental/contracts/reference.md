@@ -650,6 +650,54 @@ event:
   missing_text_shape: chat.chunk:metadata
 ```
 
+### Runtime classification and hooks
+
+At runtime, each event family becomes stream event rules evaluated by a
+stateless classifier. Each classification maps to one runtime role:
+
+| Classification | Runtime role |
+| --- | --- |
+| `guarded_delta` | `StreamEventRole.GUARDED_TEXT` |
+| `snapshot` | `StreamEventRole.TEXT_SNAPSHOT` |
+| `opaque` | `StreamEventRole.OPAQUE_METADATA` |
+| `provider_error` | `StreamEventRole.PROVIDER_ERROR` |
+
+The guarded family in the stream root example corresponds to this rule:
+
+```python
+StreamEventRule(
+    shape="chat.chunk:content",
+    model=ExampleStreamPayloadProjection,
+    role=StreamEventRole.GUARDED_TEXT,
+    match=(("object", "chat.chunk"),),
+    text_path=("choices", 0, "delta", "content"),
+    missing_text_role=StreamEventRole.OPAQUE_METADATA,
+    missing_text_shape="chat.chunk:metadata",
+)
+```
+
+The text path means `payload["choices"][0]["delta"]["content"]`.
+
+The classifier answers questions about one event in isolation:
+
+- Is its JSON shape valid?
+- Which declared variant matched?
+- Does it carry guarded text, a snapshot, metadata, or an error?
+- What text should the shared runner inspect?
+
+Handwritten hooks answer questions that require history or executable provider
+behavior:
+
+- Was a block started before receiving its delta?
+- Is this event legal after the preceding event?
+- Did the stream end with unfinished provider state?
+- How should a Guardrails failure be framed as provider-native SSE?
+
+Hooks implement `ProviderStreamHooks`: `observe_event`,
+`validate_end_of_stream`, and `encode_error`. The hooks factory takes no
+arguments and is called once for every upstream stream, so each stream gets
+fresh hook state; the stateless classifier is shared.
+
 ## Integration and stable identities
 
 `integration.endpoint` holds error codes and optional route, label, stream-hook,
