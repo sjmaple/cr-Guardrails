@@ -65,6 +65,7 @@ from nemoguardrails.server.exception_handlers import (
     streaming_capacity_error_handler,
     validation_error_handler,
 )
+from nemoguardrails.server.metrics import shutdown_metrics_exporter, start_metrics_exporter
 from nemoguardrails.server.schemas.openai import (
     GuardrailCheckRequest,
     GuardrailCheckResponse,
@@ -130,12 +131,30 @@ datastore: Optional[DataStore] = None
 
 @asynccontextmanager
 async def lifespan(app: GuardrailsApp):
-    # Startup logic here
-    """Register any additional challenges, if available at startup."""
+    """Run the server lifespan inside the metrics exporter's lifetime.
+
+    The exporter starts before anything can construct a rails instance so the
+    first IORails metric lands on a real MeterProvider (a no-op unless
+    NEMO_GUARDRAILS_SERVER_METRICS_EXPORTER is set, idempotent when the CLI
+    already started it) and is released even when startup fails inside
+    :func:`_server_lifespan`, for example on a malformed challenges.json.
+    """
     from nemoguardrails.telemetry import DeploymentTypeEnum, set_deployment_type
 
     set_deployment_type(DeploymentTypeEnum.API.value)
 
+    start_metrics_exporter()
+    try:
+        async with _server_lifespan(app):
+            yield
+    finally:
+        shutdown_metrics_exporter()
+
+
+@asynccontextmanager
+async def _server_lifespan(app: GuardrailsApp):
+    # Startup logic here
+    """Register any additional challenges, if available at startup."""
     challenges_files = os.path.join(app.rails_config_path, "challenges.json")
 
     if os.path.exists(challenges_files):
@@ -182,8 +201,6 @@ async def lifespan(app: GuardrailsApp):
         if hasattr(app, "task") and app.task is not None:
             app.task.cancel()
         log.info("Shutting down file observer")
-    else:
-        pass
 
 
 app = GuardrailsApp(
