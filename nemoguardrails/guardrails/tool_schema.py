@@ -30,12 +30,15 @@ provider-neutral so the per-provider adapters all produce the same shape:
 Completions is the engine implemented today.
 """
 
+import functools
+import re
 from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import NamedTuple
+from typing import Any, Callable, NamedTuple
 
 import jsonschema
 
+from nemoguardrails.actions.rail_outcome import RailOutcome
 from nemoguardrails.types import ToolCall
 
 
@@ -116,6 +119,14 @@ class ToolResult:
     content: str | list[dict] | None = None
     is_error: bool = False
 
+    def to_dict(self) -> dict:
+        return {
+            "call_id": self.call_id,
+            "name": self.name,
+            "content": self.content,
+            "is_error": self.is_error,
+        }
+
 
 class ToolExchange(NamedTuple):
     """One assistant turn's tool calls paired with the tool results that answer them."""
@@ -139,6 +150,22 @@ def _schema_accepts_no_arguments(schema: dict) -> bool:
     if schema.get("additionalProperties"):
         return False
     if schema.get("patternProperties"):
+        return False
+    return not any(keyword in schema for keyword in ("anyOf", "oneOf", "allOf", "$ref"))
+
+
+def _schema_rejects_argument(schema: dict, argument_name: str) -> bool:
+    """Whether *schema* has no channel that could accept *argument_name*.
+
+    Matches ``patternProperties`` with ``re.search``, since JSON Schema patterns match
+    anywhere in the string. Composition/reference keywords bail out conservatively, same as
+    ``_schema_accepts_no_arguments``.
+    """
+    if argument_name in schema.get("properties", {}):
+        return False
+    if schema.get("additionalProperties") is not False:
+        return False
+    if any(re.search(pattern, argument_name) for pattern in schema.get("patternProperties", {})):
         return False
     return not any(keyword in schema for keyword in ("anyOf", "oneOf", "allOf", "$ref"))
 
@@ -177,3 +204,61 @@ def validate_arguments(tool: Tool, arguments: dict) -> str | None:
     if _schema_accepts_no_arguments(tool.arguments_schema):
         return _no_arguments_reason(tool, arguments)
     return None
+
+
+def tool_output_validation(func: Callable[..., Any]) -> Callable[..., Any]:
+    """Validate a TOOL_OUTPUT action's arguments against the tool's schema before it runs.
+
+    Every action bound to a ``TOOL_OUTPUT`` surface must carry this decorator (enforced by
+    ``test_every_tool_output_action_validates_arguments``). Blocks before the action body
+    runs if the call's tool isn't declared, or its arguments don't match the schema. Raises
+    if the action was bound a ``$argument=`` name (see ``scope_arguments``) the schema
+    doesn't accept, since that is a config defect rather than a per-call decision.
+    """
+
+    @functools.wraps(func)
+    async def wrapper(*args: Any, **kwargs: Any) -> RailOutcome:
+        tool_call: ToolCall = kwargs["tool_call"]
+        tool_definition: Tool | None = kwargs["tool_definition"]
+        name = tool_call.function.name or tool_call.type
+        if tool_definition is None:
+            return RailOutcome.block(reason=f"tool call '{name}' is not an allowed tool")
+        reason = validate_arguments(tool_definition, tool_call.function.arguments)
+        if reason is not None:
+            return RailOutcome.block(reason=reason)
+
+        argument_name = kwargs.get("argument_name")
+        if argument_name is not None:
+            schema = tool_definition.arguments_schema
+            if schema is None:
+                raise ValueError(f"tool '{name}' declares no schema to validate argument '{argument_name}' against")
+            if _schema_rejects_argument(schema, argument_name):
+                raise ValueError(f"argument '{argument_name}' is not declared in tool '{name}' schema")
+
+        return await func(*args, **kwargs)
+
+    setattr(wrapper, "_has_tool_output_validation", True)
+    return wrapper
+
+
+def scope_arguments(arguments: dict, argument_name: str | None) -> dict:
+    """Narrow *arguments* to one named argument, or return it unchanged.
+
+    ``argument_name`` comes from a flow's ``$argument=<name>`` parameter, frozen at
+    compile time. Narrowing lets a check inspect one user-supplied field without seeing
+    unrelated call metadata that could false-positive.
+
+    A call that omits the named argument (schema-valid, e.g. an optional field the model
+    didn't set this time) falls back to the full, unscoped arguments rather than
+    ``{argument_name: None}``, so nothing goes unchecked just because one call happened
+    to leave a field out. This leans toward more scrutiny, not less: a check that scoped
+    to that name specifically to *avoid* an unrelated field's content may see it anyway on
+    a call where the named field is absent. A config typo or a name the schema could never
+    produce is caught earlier, at compile time, by ``tool_output_validation``.
+
+    TODO: only a single argument name is supported today; add delimiter-separated
+    multi-argument support (e.g. `$argument=a,b`) as a follow-up.
+    """
+    if argument_name is None or argument_name not in arguments:
+        return arguments
+    return {argument_name: arguments[argument_name]}
